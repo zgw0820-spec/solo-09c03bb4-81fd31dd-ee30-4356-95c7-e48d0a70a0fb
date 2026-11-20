@@ -19,18 +19,31 @@ K/V 缓存。
 - **分叉**：`POST /branches/{id}/fork`，`offset` 可指向任一已有 token 位置
   （省略则继承完整上下文）。分叉零拷贝复用继承的物理 KV，仅引用计数 +1，
   不增加缓存占用
-- **批量追加**：`POST /branches/{id}/tokens`
+- **批量追加（两阶段原子提交）**：`POST /branches/{id}/tokens`
+  1. **计算阶段（锁外、可并发）**：在本地副本上依次完成增量推理（`model.step`）
+     与整段重算（`model.forward_full`），并核对两份 next-token logits 一致。
+     此阶段不触碰任何活状态，长批次的 CPU 计算不会阻塞其他分支的续写与关闭。
+  2. **提交阶段（全局锁内、原子）**：按写入时最新的 KV 共用情况重新核算占用，
+     再一次性切换 KV 引用、追加 token、更新占用量。
+  - 增量推理、整段重算或一致性校验任一步失败 → HTTP 500，本次请求**不改变**
+    分支的 token、KV 引用与缓存用量；客户端用同一批重发是安全的，批次只会
+    被拼接一次（不会因 500 重试而拼两遍）
   - 共享 KV 上追加先做写时复制（COW），只复制该分支视图内的有效部分，
     其他分支上下文不受影响
   - 截断分叉后的分支追加时，先裁剪视图之外的陈旧位置再增长
-- **关闭**：`DELETE /branches/{id}`；某份 KV 的最后一个引用关闭后立即释放
+- **关闭**：`DELETE /branches/{id}`；某份 KV 的最后一个引用关闭后立即释放。
+  若分支在某次追加的计算期间被关闭，该在途追加在提交时得到 **404**，无任何写入
 - **容量**：按实际保存的 token 位置数计（所有存活物理 KV 的有效长度之和；
-  共享不重复计数）。超限的提交在任何状态修改之前检查，**整批拒绝**（HTTP 413），
-  原分支内容与全局占用量保持不变
-- **并发**：单进程内所有操作为同一把可重入锁保护的原子操作，
-  各分支只使用自己的上下文
+  共享不重复计数）。容量在提交阶段按当时的 KV 共用情况与实时占用核算，
+  超限的提交整批拒绝（HTTP 413），原分支内容与全局占用量保持不变
+- **并发**：
+  - 阻塞型端点均为同步 `def`，由 Starlette 放入工作线程池执行，长批计算
+    不占用事件循环，其他分支可并行续写与关闭
+  - 每分支一把独立锁串行化针对同一分支的并发追加，成功批次严格逐批接上
+    （token 不丢、不重）；全局锁只保护短暂的检查与提交
 - 每次成功响应都返回当前缓存用量；建立上下文 / 分叉 / 追加还返回
-  `logits`（增量）与 `full_recompute_logits`（整段重算），两者一致
+  `logits`（增量）与 `full_recompute_logits`（整段重算），两者一致且对应
+  提交后的完整上下文
 
 ## 用 Docker Compose 启动
 
@@ -78,10 +91,16 @@ docker compose up --build
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest            # 23 个单元/API 测试
+.venv/bin/python -m pytest            # 36 个单元/API 测试
 MAX_CACHED_TOKENS=20 .venv/bin/python -m uvicorn app.main:app --port 8000
 .venv/bin/python tools/e2e_check.py   # 对运行中的服务做真实 HTTP 端到端核对
+# 或自动拉起带一次性故障注入的本地服务（验证 500 重试与在途关闭 404）：
+.venv/bin/python tools/e2e_check.py --spawn
 ```
+
+端到端核对额外覆盖：增量/重算失败返回 500 后用同一批重试只拼一次、
+追加在途时关闭分支得到 404、长批计算期间其他分支仍可续写。故障注入仅由
+`E2E_FAIL_NEXT_*` / `E2E_BLOCK_*` 等环境变量显式开启，默认全部关闭。
 
 `requirements.txt` 为镜像运行依赖；`requirements-dev.txt` 额外包含 pytest 与
 httpx（Starlette TestClient 所需）。
@@ -101,5 +120,7 @@ Dockerfile, docker-compose.yml, requirements.txt
 ## 错误响应
 
 - `413 capacity_exceeded`：批次超限被整批拒绝，响应含当前 `usage`
-- `404 branch_not_found`：分支不存在（可能已被关闭）
+- `404 branch_not_found`：分支不存在（可能已被关闭），或在途追加提交时发现分支已关闭
+- `500 append_compute_failed`：增量推理 / 整段重算 / 两者一致性校验失败；
+  失败发生在任何状态写入之前，分支与占用量不变，可用同一批安全重试
 - `422`：请求体校验失败（空追加批次、token 越界、offset 越界）

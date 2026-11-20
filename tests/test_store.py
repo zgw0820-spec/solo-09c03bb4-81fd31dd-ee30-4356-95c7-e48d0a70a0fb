@@ -29,7 +29,7 @@ def _assert_invariants(store):
 
 def test_create_context_and_usage():
     store = BranchStore(MODEL, max_cached_tokens=128)
-    branch, logits = store.create_branch([1, 2, 3, 4])
+    branch, logits, _ = store.create_branch([1, 2, 3, 4])
     assert branch.token_ids == [1, 2, 3, 4]
     assert store.usage()["occupied_tokens"] == 4
     _assert_logits_match(store, branch)
@@ -38,10 +38,10 @@ def test_create_context_and_usage():
 
 def test_fork_shares_kv_without_extra_occupancy():
     store = BranchStore(MODEL, max_cached_tokens=128)
-    parent, _ = store.create_branch([1, 2, 3, 4])
+    parent, _, _ = store.create_branch([1, 2, 3, 4])
     occupied_before = store.usage()["occupied_tokens"]
 
-    child, child_logits = store.fork(parent.id, None)
+    child, child_logits, _ = store.fork(parent.id, None)
     # 零拷贝：占用量不变，两个分支指向同一个物理 KvState，引用计数为 2。
     assert store.usage()["occupied_tokens"] == occupied_before
     snap = {b["id"]: b for b in store.debug_snapshot()["branches"]}
@@ -55,10 +55,10 @@ def test_fork_shares_kv_without_extra_occupancy():
 
 def test_fork_at_any_token_offset_and_recompute_consistency():
     store = BranchStore(MODEL, max_cached_tokens=128)
-    parent, _ = store.create_branch([5, 6, 7, 8, 9])
+    parent, _, _ = store.create_branch([5, 6, 7, 8, 9])
 
     for offset in range(1, 6):
-        child, logits = store.fork(parent.id, offset)
+        child, logits, _ = store.fork(parent.id, offset)
         assert child.token_ids == [5, 6, 7, 8, 9][:offset]
         np.testing.assert_allclose(
             logits,
@@ -72,11 +72,11 @@ def test_fork_at_any_token_offset_and_recompute_consistency():
 
 def test_append_on_shared_kv_uses_copy_on_write():
     store = BranchStore(MODEL, max_cached_tokens=128)
-    parent, _ = store.create_branch([1, 2, 3])
-    child, _ = store.fork(parent.id, None)
+    parent, _, _ = store.create_branch([1, 2, 3])
+    child, _, _ = store.fork(parent.id, None)
 
     # 在子分支追加：父分支不受影响（COW），各自上下文独立。
-    _, logits = store.append(child.id, [4, 5])
+    _, logits, _ = store.append(child.id, [4, 5])
     assert child.token_ids == [1, 2, 3, 4, 5]
     assert parent.token_ids == [1, 2, 3]
     _assert_logits_match(store, child)
@@ -93,14 +93,14 @@ def test_append_on_shared_kv_uses_copy_on_write():
 
 def test_truncated_fork_then_append():
     store = BranchStore(MODEL, max_cached_tokens=128)
-    parent, _ = store.create_branch([1, 2, 3, 4, 5])
-    child, _ = store.fork(parent.id, offset=2)  # 只继承 [1, 2]
+    parent, _, _ = store.create_branch([1, 2, 3, 4, 5])
+    child, _, _ = store.fork(parent.id, offset=2)  # 只继承 [1, 2]
 
     # 截断分叉不增加占用（仍只有一份物理 KV）。
     assert store.usage()["occupied_tokens"] == 5
     _assert_logits_match(store, child)
 
-    _, logits = store.append(child.id, [9])
+    _, logits, _ = store.append(child.id, [9])
     assert child.token_ids == [1, 2, 9]
     assert parent.token_ids == [1, 2, 3, 4, 5]
     np.testing.assert_allclose(
@@ -115,8 +115,8 @@ def test_truncated_fork_then_append():
 
 def test_close_releases_kv_after_last_reference():
     store = BranchStore(MODEL, max_cached_tokens=128)
-    parent, _ = store.create_branch([1, 2, 3, 4])
-    child, _ = store.fork(parent.id, None)
+    parent, _, _ = store.create_branch([1, 2, 3, 4])
+    child, _, _ = store.fork(parent.id, None)
 
     # 关闭父分支：KV 仍被子分支引用，占用不释放。
     store.close(parent.id)
@@ -132,7 +132,7 @@ def test_close_releases_kv_after_last_reference():
 
 def test_capacity_exceeded_rejects_whole_batch_atomically():
     store = BranchStore(MODEL, max_cached_tokens=10)
-    branch, _ = store.create_branch([1, 2, 3])  # 占用 3
+    branch, _, _ = store.create_branch([1, 2, 3])  # 占用 3
     tokens_before = list(branch.token_ids)
     occupied_before = store.usage()["occupied_tokens"]
 
@@ -160,8 +160,8 @@ def test_capacity_exceeded_rejects_whole_batch_atomically():
 def test_capacity_exceeded_with_cow_counts_new_state():
     """共享 KV 上追加：容量预检必须把 COW 产生的新 KV 长度计入。"""
     store = BranchStore(MODEL, max_cached_tokens=10)
-    parent, _ = store.create_branch([1, 2, 3, 4, 5, 6])  # 占用 6
-    child, _ = store.fork(parent.id, None)  # 共享，仍为 6
+    parent, _, _ = store.create_branch([1, 2, 3, 4, 5, 6])  # 占用 6
+    child, _, _ = store.fork(parent.id, None)  # 共享，仍为 6
 
     # 子分支追加 5 个：COW 后新 KV 为 6+5=11，占用 6+11=17 > 10 -> 拒绝。
     with pytest.raises(CapacityExceeded):
@@ -194,7 +194,7 @@ def test_create_context_over_capacity_rejected():
 
 def test_concurrent_appends_to_different_branches_stay_isolated():
     store = BranchStore(MODEL, max_cached_tokens=10_000)
-    root, _ = store.create_branch([1, 2])
+    root, _, _ = store.create_branch([1, 2])
     children = [store.fork(root.id, None)[0] for _ in range(8)]
     store.close(root.id)  # 子分支各自持有引用
 
@@ -227,8 +227,8 @@ def test_concurrent_appends_to_different_branches_stay_isolated():
 def test_concurrent_close_and_append_different_branches():
     """一个分支关闭、另一个分支追加，互不干扰。"""
     store = BranchStore(MODEL, max_cached_tokens=10_000)
-    a, _ = store.create_branch([1, 2, 3])
-    b, _ = store.create_branch([4, 5, 6])
+    a, _, _ = store.create_branch([1, 2, 3])
+    b, _, _ = store.create_branch([4, 5, 6])
     errors: list[Exception] = []
 
     def closer():
@@ -261,7 +261,7 @@ def test_concurrent_mixed_fork_append_close():
     import random
 
     store = BranchStore(MODEL, max_cached_tokens=100_000)
-    root, _ = store.create_branch([1, 2])
+    root, _, _ = store.create_branch([1, 2])
     errors: list[Exception] = []
 
     def worker(seed):
@@ -271,24 +271,24 @@ def test_concurrent_mixed_fork_append_close():
             try:
                 op = rng.choice(["fork", "append", "close", "fork_append"])
                 if op == "fork":
-                    child, _ = store.fork(parent, None)
+                    child, _, _ = store.fork(parent, None)
                     parent = child.id
                 elif op == "fork_append":
-                    child, _ = store.fork(parent, rng.choice([None, 1, 2]))
+                    child, _, _ = store.fork(parent, rng.choice([None, 1, 2]))
                     store.append(child.id, [rng.randrange(MODEL["vocab_size"])])
                     parent = child.id
                 elif op == "append":
                     store.append(parent, [rng.randrange(MODEL["vocab_size"])])
                 else:
                     store.close(parent)
-                    child, _ = store.fork(root.id, None)
+                    child, _, _ = store.fork(root.id, None)
                     parent = child.id
             except KeyError:
                 # 目标分支已被其他线程关闭：从根重新开始；根也没了就新建。
                 try:
-                    child, _ = store.fork(root.id, None)
+                    child, _, _ = store.fork(root.id, None)
                 except KeyError:
-                    child, _ = store.create_branch([1, 2])
+                    child, _, _ = store.create_branch([1, 2])
                 parent = child.id
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)

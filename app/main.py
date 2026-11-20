@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
@@ -27,9 +28,8 @@ from .model import (
     DEFAULT_SEED,
     DEFAULT_VOCAB_SIZE,
     build_model,
-    forward_full,
 )
-from .store import BranchStore, CapacityExceeded
+from .store import AppendComputeError, BranchStore, CapacityExceeded
 
 
 def _env_int(name: str, default: int) -> int:
@@ -102,17 +102,26 @@ class BranchResponse(BaseModel):
 
 
 def _make_response(
-    branch, logits, include_full_recompute: bool = True
+    branch,
+    logits,
+    full_recompute_logits=None,
 ) -> BranchResponse:
-    full = None
-    if include_full_recompute and branch.token_ids:
-        full = forward_full(MODEL, branch.token_ids).tolist()
+    """构造响应。
+
+    ``logits`` / ``full_recompute_logits`` 由 store 在写入前一并算好并校验
+    一致；这里只做 ndarray -> list 转换，绝不在状态写入之后再做可能失败的
+    重算（否则失败重试会把同一批 token 拼两遍）。
+    """
     return BranchResponse(
         branch_id=branch.id,
         token_ids=list(branch.token_ids),
         length=len(branch.token_ids),
-        logits=None if logits is None else logits.tolist(),
-        full_recompute_logits=full,
+        logits=None if logits is None else np.asarray(logits).tolist(),
+        full_recompute_logits=(
+            None
+            if full_recompute_logits is None
+            else np.asarray(full_recompute_logits).tolist()
+        ),
         usage=STORE.usage(),
     )
 
@@ -142,31 +151,49 @@ def create_app() -> FastAPI:
             },
         )
 
+    @app.exception_handler(AppendComputeError)
+    async def _append_compute_handler(_request: Request, exc: AppendComputeError):
+        # 500：增量推理 / 整段重算 / 一致性校验失败。store 保证失败发生在
+        # 任何状态写入之前，分支 token、KV 引用与缓存用量均保持原值；
+        # 客户端可安全重试同一批次，不会重复拼接。
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "append_compute_failed",
+                "detail": str(exc),
+                "usage": STORE.usage(),
+            },
+        )
+
+    # 注意：以下处理阻塞型同步 store 的端点全部用普通 def（而非 async def）。
+    # Starlette 会把同步端点放到 anyio 工作线程池中执行，使长批次的 CPU 计算
+    # 不会卡住唯一的事件循环线程——其他分支的追加与关闭因此能并发进行。
+    # 线程安全与原子性由 BranchStore 内部的全局锁与分支锁保证。
     @app.get("/", include_in_schema=False)
-    async def root():
+    def root():
         return RedirectResponse(url="/docs")
 
     @app.get("/health")
-    async def health():
+    def health():
         return {"status": "ok", "vocab_size": VOCAB_SIZE, "d_model": D_MODEL}
 
     @app.get("/stats")
-    async def stats():
+    def stats():
         return STORE.usage()
 
     @app.get("/branches")
-    async def list_branches():
+    def list_branches():
         return STORE.debug_snapshot()
 
     @app.post("/branches", status_code=201, response_model=BranchResponse)
-    async def create_branch(req: CreateBranchRequest):
-        branch, logits = STORE.create_branch(req.token_ids)
-        return _make_response(branch, logits)
+    def create_branch(req: CreateBranchRequest):
+        branch, logits, full_logits = STORE.create_branch(req.token_ids)
+        return _make_response(branch, logits, full_logits)
 
     @app.post("/branches/{branch_id}/fork", response_model=BranchResponse)
-    async def fork_branch(branch_id: str, req: ForkRequest):
+    def fork_branch(branch_id: str, req: ForkRequest):
         try:
-            branch, logits = STORE.fork(branch_id, req.offset)
+            branch, logits, full_logits = STORE.fork(branch_id, req.offset)
         except KeyError:
             return JSONResponse(
                 status_code=404,
@@ -177,21 +204,22 @@ def create_app() -> FastAPI:
                 status_code=422,
                 content={"error": "invalid_offset", "detail": str(exc)},
             )
-        return _make_response(branch, logits)
+        return _make_response(branch, logits, full_logits)
 
     @app.post("/branches/{branch_id}/tokens", response_model=BranchResponse)
-    async def append_tokens(branch_id: str, req: AppendTokensRequest):
+    def append_tokens(branch_id: str, req: AppendTokensRequest):
         try:
-            branch, logits = STORE.append(branch_id, req.token_ids)
+            branch, logits, full_logits = STORE.append(branch_id, req.token_ids)
         except KeyError:
+            # 分支不存在，或在途追加的提交阶段发现分支已被关闭。
             return JSONResponse(
                 status_code=404,
                 content={"error": "branch_not_found", "branch_id": branch_id},
             )
-        return _make_response(branch, logits)
+        return _make_response(branch, logits, full_logits)
 
     @app.delete("/branches/{branch_id}")
-    async def close_branch(branch_id: str):
+    def close_branch(branch_id: str):
         try:
             STORE.close(branch_id)
         except KeyError:
